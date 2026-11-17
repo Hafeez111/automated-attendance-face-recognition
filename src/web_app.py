@@ -18,6 +18,7 @@ from src.attendance import best_match
 from src.config import FACE_DETECTION_MODEL, KNOWN_FACES_DIR, ensure_directories
 from src.database import add_student, all_students, initialize_database, mark_present, today_attendance
 from src.face_database import build_face_database, load_face_database
+from src.supabase_store import SupabaseStore, is_configured
 
 
 APP_TITLE = "Attendly"
@@ -33,11 +34,21 @@ app.add_middleware(
     https_only=os.getenv("SESSION_HTTPS_ONLY", "false").lower() == "true",
 )
 
+supabase_store: SupabaseStore | None = None
+
 
 @app.on_event("startup")
 def startup() -> None:
-    initialize_database()
     ensure_directories()
+    if is_configured():
+        global supabase_store
+        supabase_store = SupabaseStore()
+    else:
+        initialize_database()
+
+
+def use_supabase() -> bool:
+    return supabase_store is not None
 
 
 def is_admin(request: Request) -> bool:
@@ -131,7 +142,7 @@ def dashboard(request: Request) -> HTMLResponse:
     redirect = admin_required(request)
     if redirect:
         return redirect
-    students = all_students()
+    students = supabase_store.all_students() if use_supabase() else all_students()
     body = f"""<h1>Admin dashboard</h1><p class="sub">Manage student face IDs and review attendance.</p>
     <div class="grid"><section class="card"><h2>{len(students)} registered students</h2><p class="sub">Add a roll number, academic data, and clear face images.</p><a href="/admin/students/new"><button>Add student</button></a></section>
     <section class="card"><h2>Attendance records</h2><p class="sub">View the current or previous daily register.</p><a href="/attendance"><button class="secondary">View attendance</button></a></section></div>
@@ -171,22 +182,48 @@ async def create_student(
     roll_number = safe_component(roll_number)
     if not all((roll_number, full_name.strip(), branch.strip(), section.strip())):
         raise HTTPException(status_code=400, detail="All student details are required.")
+    uploaded_photos: list[tuple[str, bytes, str]] = []
+    encodings: list[list[float]] = []
     folder = KNOWN_FACES_DIR / f"{roll_number}_{safe_component(full_name)}"
-    folder.mkdir(parents=True, exist_ok=True)
+    if not use_supabase():
+        folder.mkdir(parents=True, exist_ok=True)
     saved = 0
     for index, photo in enumerate(photos, 1):
-        image = cv2.imdecode(np.frombuffer(await photo.read(), dtype=np.uint8), cv2.IMREAD_COLOR)
+        contents = await photo.read()
+        image = cv2.imdecode(np.frombuffer(contents, dtype=np.uint8), cv2.IMREAD_COLOR)
         if image is not None:
-            cv2.imwrite(str(folder / f"sample_{index:03d}.jpg"), image)
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            locations = face_recognition.face_locations(image_rgb, model=FACE_DETECTION_MODEL)
+            image_encodings = face_recognition.face_encodings(image_rgb, known_face_locations=locations)
+            if len(locations) != 1 or not image_encodings:
+                continue
+            if use_supabase():
+                uploaded_photos.append(
+                    (photo.filename or f"sample_{index:03d}.jpg", contents, photo.content_type or "image/jpeg")
+                )
+                encodings.append(image_encodings[0].tolist())
+            else:
+                cv2.imwrite(str(folder / f"sample_{index:03d}.jpg"), image)
             saved += 1
     if not saved:
-        raise HTTPException(status_code=400, detail="Upload at least one valid JPG or PNG image.")
+        raise HTTPException(status_code=400, detail="Upload at least one image with exactly one clear face.")
     try:
-        add_student(roll_number, full_name.strip(), branch.strip(), section.strip())
+        if use_supabase():
+            supabase_store.add_student(
+                roll_number,
+                full_name.strip(),
+                branch.strip(),
+                section.strip(),
+                encodings,
+                uploaded_photos,
+            )
+        else:
+            add_student(roll_number, full_name.strip(), branch.strip(), section.strip())
     except sqlite3.IntegrityError as error:
         raise HTTPException(status_code=400, detail="This roll number already exists.") from error
     try:
-        build_face_database()
+        if not use_supabase():
+            build_face_database()
     except RuntimeError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return RedirectResponse("/admin", status_code=303)
@@ -195,12 +232,18 @@ async def create_student(
 @app.get("/attendance", response_class=HTMLResponse)
 def attendance_page(request: Request, date: str | None = None) -> HTMLResponse:
     selected = date or datetime.now().strftime("%Y-%m-%d")
-    records = today_attendance(selected)
+    records = supabase_store.attendance_for_date(selected) if use_supabase() else today_attendance(selected)
     if records:
-        rows = "".join(
-            f"<tr><td>{escape(row['roll_number'])}</td><td>{escape(row['full_name'])}</td><td>{escape(row['branch'])}</td><td>{escape(row['section'])}</td><td>{escape(row['attendance_time'])}</td><td>{escape(row['status'])}</td></tr>"
-            for row in records
-        )
+        if use_supabase():
+            rows = "".join(
+                f"<tr><td>{escape(row['roll_number'])}</td><td>{escape(row['students']['full_name'])}</td><td>{escape(row['students']['branch'])}</td><td>{escape(row['students']['section'])}</td><td>{escape(row['attendance_time'])}</td><td>{escape(row['status'])}</td></tr>"
+                for row in records
+            )
+        else:
+            rows = "".join(
+                f"<tr><td>{escape(row['roll_number'])}</td><td>{escape(row['full_name'])}</td><td>{escape(row['branch'])}</td><td>{escape(row['section'])}</td><td>{escape(row['attendance_time'])}</td><td>{escape(row['status'])}</td></tr>"
+                for row in records
+            )
         table = f"<table><thead><tr><th>Roll number</th><th>Name</th><th>Branch</th><th>Section</th><th>Time</th><th>Status</th></tr></thead><tbody>{rows}</tbody></table>"
     else:
         table = '<p class="empty">No attendance records for this date.</p>'
@@ -227,12 +270,19 @@ async def recognize(image: UploadFile = File(...)) -> dict[str, str | bool | flo
     if not encodings:
         return {"recognized": False, "message": "Face encoding could not be generated."}
     try:
-        match, distance = best_match(encodings[0], load_face_database())
+        known_faces = supabase_store.known_faces() if use_supabase() else load_face_database()
+        if not known_faces:
+            return {"recognized": False, "message": "No enrolled students are available yet."}
+        match, distance = best_match(encodings[0], known_faces)
     except RuntimeError:
         return {"recognized": False, "message": "No enrolled students are available yet."}
     if match is None:
         return {"recognized": False, "message": "Face not recognized.", "distance": round(distance, 3)}
     now = datetime.now()
-    marked = mark_present(match.student_id, now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"))
+    marked = (
+        supabase_store.mark_present(match.student_id, now)
+        if use_supabase()
+        else mark_present(match.student_id, now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"))
+    )
     message = "Attendance marked successfully" if marked else "Attendance was already marked today"
     return {"recognized": True, "marked": marked, "student_id": match.student_id, "name": match.name, "message": f"{match.name}: {message}.", "distance": round(distance, 3)}
