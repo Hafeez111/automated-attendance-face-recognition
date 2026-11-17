@@ -2,11 +2,9 @@ services:
   - type: web
     name: face-attendance
     runtime: docker
-    plan: starter
+    plan: free
     healthCheckPath: /health
     envVars:
-      - key: DATA_DIR
-        value: /var/data
       - key: SESSION_HTTPS_ONLY
         value: "true"
       - key: SESSION_SECRET
@@ -15,7 +13,7 @@ services:
         value: admin
       - key: ADMIN_PASSWORD
         sync: false
-    disk:
-      name: attendance-data
-      mountPath: /var/data
-      sizeGB: 1
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
