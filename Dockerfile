@@ -21,6 +21,6 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src ./src
-COPY data ./data
+RUN mkdir -p /app/data
 
 CMD exec uvicorn src.web_app:app --host 0.0.0.0 --port $PORT
