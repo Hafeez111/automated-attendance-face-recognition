@@ -17,8 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.render.txt ./
+RUN pip install --no-cache-dir -r requirements.render.txt \
+    && pip install --no-cache-dir --no-deps face-recognition==1.3.0
 
 COPY src ./src
 RUN mkdir -p /app/data
